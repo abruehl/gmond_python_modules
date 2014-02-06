@@ -1,0 +1,203 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import threading
+import time
+import urllib2
+import traceback
+import re
+import copy
+
+# global to store state for "total accesses"
+METRICS = {
+    'time' : 0,
+    'data' : {}
+}
+
+LAST_METRICS = copy.deepcopy(METRICS)
+METRICS_CACHE_MAX = 5
+
+#Metric prefix
+NAME_PREFIX = "ap_"
+SSL_NAME_PREFIX = "apssl_"
+
+SERVER_STATUS_URL = ""
+
+descriptors = list()
+Desc_Skel   = {}
+Scoreboard  = {
+    NAME_PREFIX + 'calling'         : { 'key': 'calling', 'desc': 'Processes Calling' },
+    NAME_PREFIX + 'writing'         : { 'key': 'writing', 'desc': 'Processes Writing' },
+    NAME_PREFIX + 'active'          : { 'key': 'active',  'desc': 'Active Request' },
+    NAME_PREFIX + 'queued'          : { 'key': 'queued',  'desc': 'Queued Requests' }
+    }
+Scoreboard_bykey = dict([(v["key"],k) for (k,v) in Scoreboard.iteritems()])
+
+Metric_Map = {
+    'Uptime' : NAME_PREFIX + "uptime",
+    'IdleWorkers' : NAME_PREFIX + "idle_workers",
+    'BusyWorkers' : NAME_PREFIX + "busy_workers",
+    'Total kBytes' : NAME_PREFIX + "bytes",
+    'CPULoad' : NAME_PREFIX + "cpuload",
+    "Total Accesses" : NAME_PREFIX + "rps"
+}
+
+def get_metrics():
+
+    global METRICS, LAST_METRICS, SERVER_STATUS_URL, COLLECT_SSL
+
+    if (time.time() - METRICS['time']) > METRICS_CACHE_MAX:
+
+        metrics = dict( [(k, 0) for k in Scoreboard.keys()] )
+
+        # This is the short server-status. Lacks SSL metrics
+        try:
+            req = urllib2.Request(SERVER_STATUS_URL)
+            
+            # Download the status file
+            res = urllib2.urlopen(req, None, 2)
+
+            for line in res:
+               print(line)
+               split_line = line.rstrip().split(": ")
+               long_metric_name = split_line[0]
+               print '#################'
+               print long_metric_name.rsplit(' ', 1)[-1]
+               print split_line[1]
+               print '#################'
+               metric_name = long_metric_name.rsplit(' ', 1)[0]
+               metrics[metric_name] = split_line[1]
+
+        except urllib2.URLError:
+             traceback.print_exc()
+
+        LAST_METRICS = copy.deepcopy(METRICS)
+        METRICS = {
+            'time': time.time(),
+            'data': metrics
+        }
+
+    return [METRICS, LAST_METRICS]
+
+
+def get_value(name):
+    """Return a value for the requested metric"""
+
+    metrics = get_metrics()[0]
+
+    try:
+        result = metrics['data'][name]
+    except StandardError:
+        result = 0
+
+    return result
+
+def get_delta(name):
+    """Return change over time for the requested metric"""
+
+    # get metrics
+    [curr_metrics, last_metrics] = get_metrics()
+
+    # If it's ap_bytes metric multiply result by 1024
+    if name == NAME_PREFIX + "bytes":
+        multiplier = 1024
+    else:
+        multiplier = 1
+
+    try:
+      delta = multiplier * (float(curr_metrics['data'][name]) - float(last_metrics['data'][name])) /(curr_metrics['time'] - last_metrics['time'])
+      if delta < 0:
+	print name + " is less 0"
+	delta = 0
+    except KeyError:
+      delta = 0.0      
+
+    return delta
+
+
+def create_desc(prop):
+    d = Desc_Skel.copy()
+    for k,v in prop.iteritems():
+        d[k] = v
+    return d
+
+def metric_init(params):
+    global descriptors, Desc_Skel, SERVER_STATUS_URL, COLLECT_SSL
+
+    print '[raindrops] Received the following parameters'
+    print params
+
+    Desc_Skel = {
+        'name'        : 'XXX',
+        'call_back'   : get_value,
+        'time_max'    : 60,
+        'value_type'  : 'uint',
+        'units'       : 'proc',
+        'slope'       : 'both',
+        'format'      : '%u',
+        'description' : 'XXX',
+        'groups'      : 'unicorn'
+        }
+
+    if "refresh_rate" not in params:
+        params["refresh_rate"] = 15
+
+    if "url" not in params:
+        params["url"] = "http://127.0.0.1:3000/_raindrops"
+    
+    SERVER_STATUS_URL = params["url"]
+
+    
+    descriptors.append(create_desc({
+                "name"       : NAME_PREFIX + "calling",
+                "units"      : "calling",
+                "call_back"  : get_value,
+                "slope"      : "both",
+                "description": "Currently Calling",
+                }))
+
+    descriptors.append(create_desc({
+                "name"       : NAME_PREFIX + "writing",
+                "units"      : "writing",
+                "call_back"  : get_value,
+                "slope"      : "both",
+                "description": "Currently Writing",
+                }))
+
+    descriptors.append(create_desc({
+                "name"       : NAME_PREFIX + "active",
+                "units"      : "active",
+                "call_back"  : get_value,
+                "slope"      : "both",
+                "description": "Active Requests",
+                }))
+
+    descriptors.append(create_desc({
+                "name"       : NAME_PREFIX + "queued",
+                "units"      : "queued",
+                "call_back"  : get_value,
+                "slope"      : "both",
+                "description": "Queued Requests",
+                }))
+        
+    return descriptors
+
+def metric_cleanup():
+    '''Clean up the metric module.'''
+    _Worker_Thread.shutdown()
+
+if __name__ == '__main__':
+    try:
+        params = {
+            'url'         : 'http://127.0.0.1:3000/_raindrops',
+            'collect_ssl' : False
+            }
+        metric_init(params)
+        while True:
+            for d in descriptors:
+                v = d['call_back'](d['name'])
+                print 'value for %s is %s'   % (d['name'], v)
+            time.sleep(15)
+    except KeyboardInterrupt:
+        os._exit(1)
