@@ -42,12 +42,26 @@ class UpdateMetricThread(threading.Thread):
 
         self.status       = "sudo /usr/bin/passenger-status"
         self.memory_stats = "sudo /usr/bin/passenger-memory-stats"
+        self.passenger_version = "/usr/bin/passenger --version"
         if "status" in params:
             self.status = params["status"]
         if "memory_stats" in params:
             self.memory_stats = params["memory_stats"]
         self.mp      = params["metrix_prefix"]
-        self.status_regex   = {
+        #only match the major version
+        self.version_regex = r"Phusion Passenger version ([0-9])"
+         
+        #active/inactive is no longer simple.  Requires own loop.
+        self.status_regex_v4   = {
+          'max_pool_size':        r"^Max pool size\s+: (\d+)",
+          'open_processes':       r"^Processes\s+: (\d+)",
+          'global_queue_depth':   r".*Requests in queue: (\d+)",
+          'memory_usage':         r"^### Total private dirty RSS:\s+(\d+)"
+        }
+
+        self.active_processes_v4 = r"^.* Sessions: (\d+)"
+
+        self.status_regex_v3   = {
           'max_pool_size':        r"^max\s+= (\d+)",
           'open_processes':       r"^count\s+= (\d+)",
           'processes_active':     r"^active\s+= (\d+)",
@@ -74,15 +88,50 @@ class UpdateMetricThread(threading.Thread):
         self.running = False
 
     def update_metric(self):
+        version_output = timeout_command(self.passenger_version, self.timeout)
         status_output = timeout_command(self.status, self.timeout)
         status_output += timeout_command(self.memory_stats, self.timeout)[-1:] # to get last line of memory output
         dprint("%s", status_output)
+        
+        #find passenger version
+        #default version is 3
+        self.version = 3
+        for line in version_output: 
+          result = re.search(self.version_regex, line)
+          if result:
+            self.version = int(result.group(1))
+        dprint("%s",version_output)
+        dprint("Detected Passenger Version %s", self.version)
+
+        #use proper regex for this version      
+        if self.version == 4:
+          self.status_regex = self.status_regex_v4
+        else:
+          self.status_regex = self.status_regex_v3 
+
+        #itterate through the simple ones and capture value
         for line in status_output:
           for (name,regex) in self.status_regex.iteritems():
             result = re.search(regex,line)
             if result:
               dprint("%s = %d", name, int(result.group(1)))
               self.metric[self.mp+'_'+name] = int(result.group(1))
+   
+        #special ones in version 4
+        if self.version == 4:
+          #loop the output and sum up 'active'
+          active = 0
+          for line in status_output:
+            result = re.search(self.active_processes_v4, line)
+            if result:
+              active = active + int(result.group(1))
+          # active == active
+          self.metric[self.mp+'_processes_active'] = active
+          # active = total - active
+          self.metric[self.mp+'_processes_inactive'] = (self.metric[self.mp+'_open_processes'] - active) 
+
+        dprint("%s",self.metric)
+
 
     def metric_of(self, name):
         val = 0
